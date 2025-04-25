@@ -26,6 +26,7 @@
   loop: "{{ __firewall_conflicting_services_status.results }}"
   when:
     - firewall_disable_conflicting_services | bool
+    - __firewall_is_booted
     - item.rc == 0
 
 - name: Unmask firewalld service
@@ -34,11 +35,17 @@
     masked: false
   when: ansible_facts.service_mgr == "systemd"
 
-- name: Enable and start firewalld service
+- name: Enable firewalld service
+  service:
+    name: "{{ __firewall_service }}"
+    enabled: true
+
+- name: Start firewalld service
   service:
     name: "{{ __firewall_service }}"
     state: started
     enabled: true
+  when: __firewall_is_booted
 
 - name: Check if previous replaced is defined
   set_fact:
@@ -142,6 +149,7 @@
             value: replaced
       firewall_lib_facts:
         detailed: "{{ item.detailed | default(False) }}"
+        online: "{{ __firewall_is_booted }}"
       loop: "{{ fw | map('dict2items') | map('difference', __previous) |
         select | map('items2dict') | list }}"
       register: __firewalld_facts
@@ -157,6 +165,7 @@
   block:
     - name: Gather firewall config if no arguments
       firewall_lib_facts:
+        online: "{{ __firewall_is_booted }}"
         detailed: false
       register: __firewalld_facts
 
