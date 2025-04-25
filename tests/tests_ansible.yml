@@ -74,6 +74,7 @@
           command: firewall-cmd --reload
           register: result
           failed_when: result.failed or not result.changed
+          when: __firewall_is_booted
 
         # TEST
 
@@ -739,3 +740,4 @@
               command: firewall-cmd --reload
               register: result
               failed_when: result.failed or not result.changed
+              when: __firewall_is_booted
