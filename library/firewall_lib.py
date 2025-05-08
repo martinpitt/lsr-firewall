@@ -287,6 +287,8 @@ try:
         FirewallClientIPSetSettings,
     )
 
+    from firewall.errors import FirewallError
+
     HAS_FIREWALLD = True
 except ImportError:
     HAS_FIREWALLD = False
@@ -991,12 +993,19 @@ def main():
     if not HAS_FIREWALLD:
         module.fail_json(msg="No firewalld")
 
-    fw = FirewallClient()
-
-    fw_offline = False
-    if not fw.connected:
-        # Firewalld is not currently running, permanent-only operations
+    try:
+        fw = FirewallClient()
+        # older versions succeed the constructor
+        fw_offline = not fw.connected
+    except FirewallError as e:
+        # newer versions fail the constructor
+        module.warn(
+            "Cannot connect to firewalld, using offline mode: %s" % str(e)
+        )
         fw_offline = True
+
+    if fw_offline:
+        # Firewalld is not currently running, permanent-only operations
         runtime = False
         permanent = True
 
