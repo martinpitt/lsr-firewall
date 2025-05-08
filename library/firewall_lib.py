@@ -369,7 +369,7 @@ def create_service(module, fw, service):
     return fw_service, fw_service_settings
 
 
-def create_ipset(module, fw, ipset, ipset_type):
+def create_ipset(module, fw, ipset, ipset_type, fw_offline):
     if not ipset_type:
         module.fail_json(msg="ipset_type needed when creating a new ipset")
 
@@ -377,9 +377,12 @@ def create_ipset(module, fw, ipset, ipset_type):
     fw_ipset_settings = FirewallClientIPSetSettings()
     fw_ipset_settings.setType(ipset_type)
     if not module.check_mode:
-        fw.config().addIPSet(ipset, fw_ipset_settings)
-        fw_ipset = fw.config().getIPSetByName(ipset)
-        fw_ipset_settings = fw_ipset.getSettings()
+        if fw_offline:
+            fw_ipset = fw.config.new_ipset(ipset, fw_ipset_settings.settings)
+        else:
+            fw.config().addIPSet(ipset, fw_ipset_settings)
+            fw_ipset = fw.config().getIPSetByName(ipset)
+            fw_ipset_settings = fw_ipset.getSettings()
 
     return fw_ipset, fw_ipset_settings
 
@@ -622,10 +625,6 @@ def check_allow_zone_drifting(firewalld_conf):
 # Return True if all suboptions were emptied as a result
 def check_firewalld_conf(firewalld_conf):
     check_allow_zone_drifting(firewalld_conf)
-
-
-def set_the_default_zone(fw, set_default_zone):
-    fw.setDefaultZone(set_default_zone)
 
 
 def main():
@@ -1045,7 +1044,7 @@ def main():
     fw_settings = None
     if fw_offline:
         # if zone is None, we will use default zone which always exists
-        zone_exists = zone is None or zone in fw.zone.get_zones()
+        zone_exists = zone is None or zone in fw.config.get_zones()
         if not zone_exists and not zone_operation:
             module.fail_json(msg="Permanent zone '%s' does not exist." % zone)
         elif zone_exists:
@@ -1079,7 +1078,7 @@ def main():
 
     # firewalld.conf
     if firewalld_conf:
-        fw_config = fw.config()
+        fw_config = fw.config if fw_offline else fw.config()
         if not allow_zone_drifting_deprecated and firewalld_conf.get(
             "allow_zone_drifting"
         ) != fw_config.get_property("AllowZoneDrifting"):
@@ -1094,7 +1093,10 @@ def main():
     if zone_operation:
         if state == "present" and not zone_exists:
             if not module.check_mode:
-                fw.config().addZone(zone, FirewallClientZoneSettings())
+                if fw_offline:
+                    fw.config.new_zone_dict(zone, FirewallClientZoneSettings().getSettingsDict())
+                else:
+                    fw.config().addZone(zone, FirewallClientZoneSettings())
                 need_reload = True
             changed = True
         elif state == "absent" and zone_exists:
@@ -1107,20 +1109,30 @@ def main():
 
     # set default zone
     if set_default_zone:
-        if fw.getDefaultZone() != set_default_zone:
-            set_the_default_zone(fw, set_default_zone)
-            changed = True
+        if fw_offline:
+            if fw.get_default_zone() != set_default_zone:
+                fw.set_default_zone(set_default_zone)
+                changed = True
+        else:
+            if fw.getDefaultZone() != set_default_zone:
+                fw.setDefaultZone(set_default_zone)
+                changed = True
 
     # service
     if service_operation and permanent:
-        service_exists = service in fw.config().getServiceNames()
-        if service_exists:
-            fw_service = fw.config().getServiceByName(service)
-            fw_service_settings = fw_service.getSettings()
-        elif state == "present":
-            fw_service, fw_service_settings = create_service(module, fw, service)
-            changed = True
-            service_exists = True
+        if fw_offline:
+            service_exists = service in fw.config.get_services()
+            if service_exists:
+                fw_service = fw.config.get_service(service)
+        else:
+            service_exists = service in fw.config().getServiceNames()
+            if service_exists:
+                fw_service = fw.config().getServiceByName(service)
+                fw_service_settings = fw_service.getSettings()
+            elif state == "present":
+                fw_service, fw_service_settings = create_service(module, fw, service)
+                changed = True
+                service_exists = True
 
         if state == "present":
             if (
@@ -1230,7 +1242,8 @@ def main():
             need_reload = True
     else:
         for item in service:
-            service_exists = item in fw.config().getServiceNames()
+            services = fw.config.get_services() if fw_offline else fw.config().getServiceNames()
+            service_exists = item in services
             if state == "enabled" and service_exists:
                 if runtime and not fw.queryService(zone, item):
                     if not module.check_mode:
@@ -1260,20 +1273,30 @@ def main():
 
     # ipset operations
     if ipset_operation:
-        ipset_exists = ipset in fw.config().getIPSetNames()
+        ipsets = fw.config.get_ipsets() if fw_offline else fw.config().getIPSetNames()
+        ipset_exists = ipset in ipsets
         fw_ipset = None
         fw_ipset_settings = None
         if ipset_exists:
-            fw_ipset = fw.config().getIPSetByName(ipset)
-            fw_ipset_settings = fw_ipset.getSettings()
-            if ipset_type and ipset_type != fw_ipset_settings.getType():
-                module.fail_json(
-                    msg="Name conflict when creating ipset - "
-                    "ipset %s of type %s already exists"
-                    % (ipset, fw_ipset_settings.getType())
-                )
+            if fw_offline:
+                fw_ipset = fw.config.get_ip_set(ipset)
+                if fw_ipset.type and ipset_type != fw_ipset.type:
+                    module.fail_json(
+                        msg="Name conflict when creating ipset - "
+                        "ipset %s of type %s already exists"
+                        % (ipset, fw_ipset.type)
+                    )
+            else:
+                fw_ipset = fw.config().getIPSetByName(ipset)
+                fw_ipset_settings = fw_ipset.getSettings()
+                if ipset_type and ipset_type != fw_ipset_settings.getType():
+                    module.fail_json(
+                        msg="Name conflict when creating ipset - "
+                        "ipset %s of type %s already exists"
+                        % (ipset, fw_ipset_settings.getType())
+                    )
         elif state == "present":
-            fw_ipset, fw_ipset_settings = create_ipset(module, fw, ipset, ipset_type)
+            fw_ipset, fw_ipset_settings = create_ipset(module, fw, ipset, ipset_type, fw_offline)
             changed = True
             ipset_exists = True
         if state == "present":
@@ -1328,7 +1351,10 @@ def main():
                         )
                 elif ipset_exists:
                     if not module.check_mode:
-                        fw_ipset.remove()
+                        if fw_offline:
+                            fw.config.remove_ipset(fw_ipset)
+                        else:
+                            fw_ipset.remove()
                         ipset_exists = False
                     changed = True
 
