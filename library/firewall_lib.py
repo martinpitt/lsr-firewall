@@ -1,10 +1,11 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2016,2017,2020,2021 Red Hat, Inc.
+# Copyright (C) 2016 - 2025 Red Hat, Inc.
 # Reusing some firewalld code
 # Authors:
 # Thomas Woerner <twoerner@redhat.com>
+# Martin Pitt <mpitt@redhat.com>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -37,7 +38,7 @@ requirements:
   - python3-firewall or python-firewall
 description:
   Manage firewall with firewalld on Fedora and RHEL-7+.
-author: "Thomas Woerner (@t-woerner)"
+author: "Thomas Woerner (@t-woerner), Martin Pitt (@martinpitt)"
 options:
   firewalld_conf:
     description:
@@ -262,6 +263,14 @@ options:
       If false, do not report changed true even if changed.
     required: false
     type: bool
+    default: true
+  online:
+    description:
+      When true, use the D-Bus API to query the status from the running system.
+      Otherwise, use firewall-offline-cmd(1). Offline mode is
+      incompatible with "runtime" mode.
+    type: bool
+    required: false
     default: true
 """
 
@@ -964,6 +973,295 @@ class OnlineAPIBackend:
                 self.changed = True
 
 
+class OfflineCLIBackend:
+    """Implement operations with firewall-offline-cmd.
+
+    This works during container builds and similar environments.
+    """
+
+    def __init__(
+        self, module, permanent, runtime, zone_operation, zone, state, timeout
+    ):
+        self.module = module
+        self.state = state
+        self.timeout = timeout
+
+        self.changed = False
+
+        if not permanent:
+            # Should Not Happen™, this is already checked outside; but belt-and-suspenders
+            module.fail_json(msg="offline environments must use permanent mode")
+        if runtime:
+            module.fail_json(
+                msg="runtime mode is not supported in offline environments"
+            )
+
+        # Get zone to operate on
+        if zone is None:
+            self.zone = self.cmd("--get-default-zone")
+            self.zone_exists = True
+        else:
+            zones = self.cmd("--get-zones").split()
+            self.zone_exists = zone in zones
+
+        if not self.zone_exists and not zone_operation:
+            module.fail_json(msg="Zone '%s' does not exist." % zone)
+
+    def _call_offline_cmd(self, *args, check_rc):
+        argv = ["firewall-offline-cmd", *args]
+        (rc, out, err) = self.module.run_command(argv, check_rc=check_rc)
+        out = out.strip()
+        self.module.debug("OfflineCLIBackend: %r -> exit %i, out: %s" % (argv, rc, out))
+        return (rc, out)
+
+    def cmd(self, *args):
+        """Call firewall-offline-cmd with given arguments, expecting success."""
+
+        return self._call_offline_cmd(*args, check_rc=True)[1]
+
+    def change(self, *args):
+        """Like cmd(), but skipped in check_mode.
+
+        Also set self.changed.
+        """
+        if not self.module.check_mode:
+            self.cmd(*args)
+        self.changed = True
+
+    def query(self, *args):
+        """Call firewall-offline-cmd query command, convert exit code to bool."""
+
+        rc = self._call_offline_cmd(*args, check_rc=False)[0]
+        return True if rc == 0 else False
+
+    def finalize(self):
+        # nothing to do here, all changes are written immediately in offline mode
+        pass
+
+    def check_state(self, allowed, option):
+        """Check and interpret self.state
+
+        allowed is a list of allowed values. E.g. most operations only accept
+        enabled/disabled, while others only accept present/absent, some accept
+        either. This keeps the behaviour bug-for-bug compatible with
+        OnlineAPIBackend.
+
+        Return True for enabled/present or False for disabled/absent.
+        """
+        if self.state not in allowed:
+            self.module.fail_json(
+                msg="state '%s' not accepted for option '%s'" % (self.state, option)
+            )
+
+        return self.state in ["enabled", "present"]
+
+    def set_firewalld_conf(self, firewalld_conf, allow_zone_drifting_deprecated):
+        if allow_zone_drifting_deprecated is not None:
+            self.module.fail_json(
+                msg="allow_zone_drifting is deprecated and not supported in offline mode"
+            )
+
+        # there are currently no other supported options in firewalld_conf, so
+        # this should not happen; if it ever does, implement it
+        self.module.fail_json(
+            msg="firewalld_conf is not currently supported in offline mode; please file a bug"
+        )
+
+    def set_zone(self):
+        raise NotImplementedError
+
+    def set_default_zone(self, zone):
+        if self.cmd("--get-default-zone") != zone:
+            self.change("--set-default-zone", zone)
+
+    def set_service(
+        self,
+        service_operation,
+        service,
+        description,
+        short,
+        port,
+        protocol,
+        source_port,
+        helper_module,
+        destination_ipv4,
+        destination_ipv6,
+        includes,
+    ):
+        if service_operation:
+            raise NotImplementedError
+        else:
+            known_services = self.cmd("--get-services").split()
+            enable = self.check_state(["enabled", "disabled"], "service")
+            for item in service:
+                if item not in known_services:
+                    if self.module.check_mode:
+                        self.module.warn(
+                            "Service does not exist - "
+                            + item
+                            + ". Ensure that you define the service in the playbook before running it in diff mode"
+                        )
+                        continue
+                    else:
+                        self.module.fail_json(msg="INVALID SERVICE - " + item)
+
+                cur = self.query("--zone", self.zone, "--query-service=" + item)
+
+                if cur != enable:
+                    self.change(
+                        "--zone",
+                        self.zone,
+                        "--%s-service=%s" % ("add" if enable else "remove", item),
+                    )
+
+    def set_ipset(self, ipset, description, short, ipset_type, ipset_entries):
+        raise NotImplementedError
+
+    def set_port(self, port):
+        enable = self.check_state(["enabled", "disabled"], "port")
+        for _port, _protocol in port:
+            spec = "%s/%s" % (_port, _protocol)
+            cur = self.query("--zone", self.zone, "--query-port=" + spec)
+
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    "--%s-port=%s" % ("add" if enable else "remove", spec),
+                )
+
+    def set_source_port(self, source_port):
+        enable = self.check_state(["enabled", "disabled"], "source_port")
+        for _port, _protocol in source_port:
+            spec = "%s/%s" % (_port, _protocol)
+            cur = self.query("--zone", self.zone, "--query-source-port=" + spec)
+
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    "--%s-source-port=%s" % ("add" if enable else "remove", spec),
+                )
+
+    def set_forward_port(self, forward_port):
+        enable = self.check_state(["enabled", "disabled"], "forward_port")
+        for _port, _protocol, _to_port, _to_addr in forward_port:
+            spec = "port=%s:proto=%s" % (_port, _protocol)
+            if _to_port is not None:
+                spec += ":toport=%s" % _to_port
+            if _to_addr is not None:
+                spec += ":toaddr=%s" % _to_addr
+
+            cur = self.query("--zone", self.zone, "--query-forward-port=" + spec)
+
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    "--%s-forward-port=%s" % ("add" if enable else "remove", spec),
+                )
+
+    def set_masquerade(self, masquerade):
+        cur = self.query("--zone", self.zone, "--query-masquerade")
+
+        if cur != masquerade:
+            self.change(
+                "--zone",
+                self.zone,
+                "--%s-masquerade" % ("add" if masquerade else "remove"),
+            )
+
+    def set_rich_rule(self, rich_rule):
+        enable = self.check_state(["enabled", "disabled"], "rich_rule")
+
+        for item in rich_rule:
+            # note: item is a Rich_Rule object, but its __str__() does the right thing
+            cur = self.query("--zone", self.zone, "--query-rich-rule=" + item)
+
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    "--%s-rich-rule=%s" % ("add" if enable else "remove", item),
+                )
+
+    def set_source(self, source):
+        if self.module.check_mode:
+            ipset_names = self.cmd("--get-ipsets").split()
+
+        enable = self.check_state(["enabled", "disabled"], "source")
+
+        for item in source:
+            # Error case handling for check mode
+            if (
+                self.module.check_mode
+                and item.startswith("ipset:")
+                and item.split(":")[1] not in ipset_names
+            ):
+                self.module.warn(
+                    "%s does not exist - ensure it is defined in a previous task before running play outside check mode"
+                    % item
+                )
+                self.changed = True
+            else:
+                cur = self.query("--zone", self.zone, "--query-source=" + item)
+
+                if cur != enable:
+                    self.change(
+                        "--zone",
+                        self.zone,
+                        "--%s-source=%s" % ("add" if enable else "remove", item),
+                    )
+
+    def set_interface(self, interface):
+        # we can't do this via NM like in OnlineAPIBackend, always go via firewalld config
+        enable = self.check_state(["enabled", "disabled"], "set_interface")
+
+        for item in interface:
+            cur = self.query("--zone", self.zone, "--query-interface=" + item)
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    # note: --change-interface first removes it from the old zone
+                    "--%s-interface=%s" % ("change" if enable else "remove", item),
+                )
+
+    def set_icmp_block(self, icmp_block):
+        enable = self.check_state(["enabled", "disabled"], "icmp_block")
+
+        for item in icmp_block:
+            cur = self.query("--zone", self.zone, "--query-icmp-block=" + item)
+
+            if cur != enable:
+                self.change(
+                    "--zone",
+                    self.zone,
+                    "--%s-icmp-block=%s" % ("add" if enable else "remove", item),
+                )
+
+    def set_icmp_block_inversion(self, icmp_block_inversion):
+        cur = self.query("--zone", self.zone, "--query-icmp-block-inversion")
+
+        if cur != icmp_block_inversion:
+            self.change(
+                "--zone",
+                self.zone,
+                "--%s-icmp-block-inversion"
+                % ("add" if icmp_block_inversion else "remove"),
+            )
+
+    def set_target(self, target):
+        enable = self.check_state(
+            ["enabled", "present", "disabled", "absent"], "target"
+        )
+        cur_target = self.cmd("--zone", self.zone, "--get-target")
+        new_target = target if enable else "default"
+
+        if new_target != cur_target:
+            self.change("--zone", self.zone, "--set-target", new_target)
+
+
 PCI_REGEX = re.compile("[0-9a-fA-F]{4}:[0-9a-fA-F]{4}")
 
 
@@ -1265,6 +1563,7 @@ def main():
             destination=dict(required=False, type="list", elements="str", default=[]),
             includes=dict(required=False, type="list", elements="str", default=[]),
             __report_changed=dict(required=False, type="bool", default=True),
+            online=dict(required=False, type="bool", default=True),
         ),
         supports_check_mode=True,
         required_if=(
@@ -1345,6 +1644,7 @@ def main():
     runtime = module.params["runtime"]
     state = module.params["state"]
     includes = module.params["includes"]
+    online = module.params["online"]
 
     # All options that require state to be set
     state_required = any(
@@ -1562,7 +1862,8 @@ def main():
             msg="Unsupported firewalld version %s, requires >= 0.2.11" % FW_VERSION
         )
 
-    backend = OnlineAPIBackend(
+    backendClass = OnlineAPIBackend if online else OfflineCLIBackend
+    backend = backendClass(
         module, permanent, runtime, zone_operation, zone, state, timeout
     )
 
