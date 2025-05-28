@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: MIT
+---
+- name: bootc end-to-end test
+  hosts: all
+  tags:
+    - tests::bootc-e2e
+  gather_facts: false  # test that role works in this case
+  tasks:
+
+    ## PREPARE
+    - name: Configure firewall during bootc image build
+      when: ansible_connection == "buildah"
+      block:
+        - name: Setup firewalld
+          include_role:
+            name: linux-system-roles.firewall
+          vars:
+            firewall:
+              - zone: 'internal'
+                service: ['tftp', 'ftp']
+                port: ['443/tcp', '443/udp']
+                forward_port: ['447/tcp;;1.2.3.4',
+                               '448/tcp;;1.2.3.5']
+                state: 'enabled'
+
+              - zone: customzone
+                permanent: true
+                state: present
+
+              - zone: customzone
+                permanent: true
+                masquerade: true
+                state: enabled
+
+              - set_default_zone: dmz
+                state: enabled
+
+              - service: http
+                state: enabled
+
+        - name: Fail if no changes are done
+          fail:
+            msg: "FAILED"
+          when: not firewall_lib_result.changed
+
+        - name: Create QEMU deployment
+          delegate_to: localhost
+          command: "{{ lsr_scriptdir }}/bootc-buildah-qcow.sh {{ ansible_host }}"
+
+      always:
+        - name: Cleanup
+          tags:
+            - tests::cleanup
+          block:
+            # CLEANUP: RESET TO ZONE DEFAULTS
+
+            - name: Remove customzone zone
+              command: firewall-offline-cmd --delete-zone=customzone
+              register: result
+              failed_when: result.failed and "INVALID_ZONE" not in result.stderr
+              changed_when: false
+
+            - name: Reset to zone defaults
+              shell:
+                cmd: |
+                  firewall-offline-cmd --load-zone-defaults=internal
+                  firewall-offline-cmd --load-zone-defaults=external
+                  firewall-offline-cmd --load-zone-defaults=trusted || true
+              changed_when: false
+
+    # VERIFY
+    - name: Validation of deployed image
+      when: ansible_connection != "buildah"
+      block:
+        - name: Verify firewalld zone internal services
+          command: firewall-cmd --zone=internal --list-services
+          register: result
+          changed_when: false
+          failed_when: result.failed
+                      or "tftp" not in result.stdout
+                      or "ftp" not in result.stdout
+
+        - name: Verify firewalld zone internal ports
+          command: firewall-cmd --zone=internal --list-ports
+          register: result
+          changed_when: false
+          failed_when: result.failed
+                      or "443/tcp" not in result.stdout
+                      or "443/udp" not in result.stdout
+
+        - name: Verify firewalld zone internal forward ports
+          command: firewall-cmd --zone=internal --list-forward-ports
+          register: result
+          changed_when: false
+          failed_when: result.failed
+                      or "port=447:proto=tcp:toport=:toaddr=1.2.3.4"
+                          not in result.stdout
+                      or "port=448:proto=tcp:toport=:toaddr=1.2.3.5"
+                          not in result.stdout
+
+        - name: Verify custom zone has masquerade added to it
+          command: firewall-cmd --zone=customzone --query-masquerade
+          register: result
+          changed_when: false
+          failed_when: result is failed
+                      or "yes" not in result.stdout
+
+        - name: Verify default zone was changed
+          command: firewall-cmd --get-default-zone
+          register: result
+          changed_when: false
+          failed_when: result is failed
+                      or "dmz" not in result.stdout
+
+        - name: Verify that service http has been added to the default zone dmz
+          command: firewall-cmd --zone=dmz --query-service=http
+          register: result
+          changed_when: false
+          failed_when: result is failed
+                      or "yes" not in result.stdout
