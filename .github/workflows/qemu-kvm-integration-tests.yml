@@ -137,7 +137,7 @@ jobs:
         if: steps.check_platform.outputs.supported && startsWith(matrix.scenario.env, 'qemu')
         run: >-
           tox -e ${{ matrix.scenario.env }} -- --image-name ${{ matrix.scenario.image }} --make-batch
-          --log-level debug $TOX_ARGS
+          --log-level debug $TOX_ARGS --skip-tags tests::bootc-e2e
           --lsr-report-errors-url DEFAULT --
 
       - name: Qemu result summary
@@ -183,6 +183,32 @@ jobs:
               fi
           done
           exit $rc
+
+      - name: Run bootc validation tests in QEMU
+        if: steps.check_platform.outputs.supported &&
+            startsWith(matrix.scenario.env, 'container') &&
+            endsWith(matrix.scenario.image, '-bootc')
+        run: |
+          set -euxo pipefail
+          env=$(echo "${{ matrix.scenario.env }}" | sed 's/^container-/qemu-/')
+
+          for t in $(grep -wl tests::bootc-e2e tests/tests_*.yml); do
+              test=$(basename ${t%.yml})
+              image_file="$(pwd)/tests/tmp/$test/qcow2/disk.qcow2"
+              if [ ! -e "$image_file" ]; then
+                  echo "Missing $image_file" >&2
+                  exit 1
+              fi
+
+              if tox -e "$env" -- --image-file "$image_file" \
+                     --log-level debug $TOX_ARGS \
+                     --lsr-report-errors-url DEFAULT -- "$t" >out 2>&1; then
+                  mv out "${t}-PASS.log"
+              else
+                  mv out "${t}-FAIL.log"
+                  exit 1
+              fi
+          done
 
       - name: Upload test logs on failure
         if: failure()
